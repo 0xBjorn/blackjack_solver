@@ -29,9 +29,17 @@ With ENHC rules, if the dealer has blackjack, the player loses their **entire wa
 | Implementation | Runtime | Speedup |
 |----------------|---------|---------|
 | Python | ~540s | 1x |
-| **Rust** | **~3.3s** | **160x** |
+| **Rust** | **~0.27s** | **2000x** |
 
 Both use parallel processing (16 threads) with Monte Carlo simulation converging to SEM < 0.005.
+
+### Rust Optimizations
+
+- `fastrand` instead of cryptographic RNG
+- Fixed-size stack arrays instead of heap-allocated `Vec`
+- Lookup table for O(1) card drawing
+- Aggressive inlining with `#[inline(always)]`
+- Lock-free parallel collection
 
 ## Quick Start
 
