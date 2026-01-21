@@ -1,46 +1,91 @@
 //! Deck/Shoe management for Blackjack simulation.
-//! Supports infinite deck mode for base strategy calculation.
+//! Optimized for speed with fixed-size arrays and fast RNG.
 
-use rand::prelude::*;
+use fastrand::Rng;
 
-/// Card values for infinite deck drawing
-/// Probabilities: 2-9 = 1/13 each, 10/J/Q/K = 4/13, A = 1/13
-const CARD_VALUES: [u8; 10] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-const CARD_WEIGHTS: [u32; 10] = [1, 1, 1, 1, 1, 1, 1, 1, 4, 1]; // 10-value cards have weight 4
+/// Maximum cards in a hand (5 cards + safety margin)
+pub const MAX_HAND_SIZE: usize = 12;
 
-/// Infinite deck - each card drawn independently with correct probability
-#[derive(Clone)]
-pub struct InfiniteDeck {
-    rng: ThreadRng,
-    cumulative_weights: [u32; 10],
-    total_weight: u32,
+/// Fixed-size hand to avoid heap allocations
+#[derive(Clone, Copy)]
+pub struct Hand {
+    cards: [u8; MAX_HAND_SIZE],
+    len: u8,
 }
 
-impl InfiniteDeck {
+impl Hand {
+    #[inline(always)]
     pub fn new() -> Self {
-        let mut cumulative = [0u32; 10];
-        let mut sum = 0u32;
-        for (i, &w) in CARD_WEIGHTS.iter().enumerate() {
-            sum += w;
-            cumulative[i] = sum;
-        }
-        InfiniteDeck {
-            rng: thread_rng(),
-            cumulative_weights: cumulative,
-            total_weight: sum,
+        Hand {
+            cards: [0; MAX_HAND_SIZE],
+            len: 0,
         }
     }
 
-    /// Draw a random card with correct probability distribution
-    #[inline]
-    pub fn draw(&mut self) -> u8 {
-        let r = self.rng.gen_range(0..self.total_weight);
-        for (i, &cw) in self.cumulative_weights.iter().enumerate() {
-            if r < cw {
-                return CARD_VALUES[i];
-            }
+    #[inline(always)]
+    pub fn from_cards(c1: u8, c2: u8) -> Self {
+        let mut h = Hand::new();
+        h.cards[0] = c1;
+        h.cards[1] = c2;
+        h.len = 2;
+        h
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, card: u8) {
+        self.cards[self.len as usize] = card;
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline(always)]
+    pub fn cards(&self) -> &[u8] {
+        &self.cards[..self.len as usize]
+    }
+
+    #[inline(always)]
+    pub fn first(&self) -> u8 {
+        self.cards[0]
+    }
+
+    #[inline(always)]
+    pub fn second(&self) -> u8 {
+        self.cards[1]
+    }
+}
+
+impl Default for Hand {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Infinite deck with fast RNG
+/// Uses lookup table for O(1) card drawing
+pub struct InfiniteDeck {
+    rng: Rng,
+}
+
+// Lookup table: maps random value 0-12 to card value
+// 0-7 -> 2-9, 8-11 -> 10, 12 -> 11 (Ace)
+const CARD_LOOKUP: [u8; 13] = [2, 3, 4, 5, 6, 7, 8, 9, 10, 10, 10, 10, 11];
+
+impl InfiniteDeck {
+    #[inline(always)]
+    pub fn new() -> Self {
+        InfiniteDeck {
+            rng: Rng::new(),
         }
-        CARD_VALUES[9] // Ace (shouldn't reach here)
+    }
+
+    /// Draw a random card - O(1) with lookup table
+    #[inline(always)]
+    pub fn draw(&mut self) -> u8 {
+        CARD_LOOKUP[self.rng.usize(0..13)]
     }
 }
 
@@ -50,47 +95,41 @@ impl Default for InfiniteDeck {
     }
 }
 
-/// Result of hand value calculation
-#[derive(Debug, Clone, Copy)]
-pub struct HandValue {
-    pub total: u8,
-    pub is_soft: bool,
-}
+/// Calculate hand value - optimized with early exit
+#[inline(always)]
+pub fn hand_value(hand: &Hand) -> (u8, bool) {
+    let cards = hand.cards();
+    let mut total: u16 = 0;
+    let mut aces: u8 = 0;
 
-/// Calculate the value of a hand
-#[inline]
-pub fn hand_value(cards: &[u8]) -> HandValue {
-    let mut total: u16 = cards.iter().map(|&c| c as u16).sum();
-    let mut aces = cards.iter().filter(|&&c| c == 11).count();
+    for &card in cards {
+        total += card as u16;
+        aces += (card == 11) as u8;
+    }
 
-    // Convert aces from 11 to 1 as needed to avoid bust
+    // Convert aces from 11 to 1 as needed
     while total > 21 && aces > 0 {
         total -= 10;
         aces -= 1;
     }
 
-    HandValue {
-        total: total as u8,
-        is_soft: aces > 0 && total <= 21,
+    (total as u8, aces > 0)
+}
+
+/// Check if hand is a natural blackjack
+#[inline(always)]
+pub fn is_blackjack(hand: &Hand) -> bool {
+    hand.len() == 2 && {
+        let (total, _) = hand_value(hand);
+        total == 21
     }
 }
 
-/// Check if hand is a natural blackjack (Ace + 10-value on first 2 cards)
-#[inline]
-pub fn is_blackjack(cards: &[u8]) -> bool {
-    cards.len() == 2 && hand_value(cards).total == 21
-}
-
-/// Check if hand is busted (over 21)
-#[inline]
-pub fn is_bust(cards: &[u8]) -> bool {
-    hand_value(cards).total > 21
-}
-
-/// Check if hand is a splittable pair
-#[inline]
-pub fn is_pair(cards: &[u8]) -> bool {
-    cards.len() == 2 && cards[0] == cards[1]
+/// Check if hand is busted
+#[inline(always)]
+pub fn is_bust(hand: &Hand) -> bool {
+    let (total, _) = hand_value(hand);
+    total > 21
 }
 
 /// Player state for strategy lookup
@@ -103,47 +142,33 @@ pub struct PlayerState {
 }
 
 impl PlayerState {
+    #[inline(always)]
     pub fn new(total: u8, dealer_upcard: u8, is_soft: bool, is_pair: bool) -> Self {
-        PlayerState {
-            total,
-            dealer_upcard,
-            is_soft,
-            is_pair,
-        }
+        PlayerState { total, dealer_upcard, is_soft, is_pair }
     }
 }
 
-/// Generate cards that create a given state
-pub fn get_cards_for_state(total: u8, is_soft: bool, is_pair: bool) -> Vec<u8> {
+/// Generate starting hand for a state
+#[inline(always)]
+pub fn get_hand_for_state(total: u8, is_soft: bool, is_pair: bool) -> Hand {
     if is_pair {
         if is_soft {
-            // A,A
-            return vec![11, 11];
+            Hand::from_cards(11, 11) // A,A
         } else {
             let card = total / 2;
-            return vec![card, card];
+            Hand::from_cards(card, card)
         }
-    }
-
-    if is_soft {
-        // Soft hands: Ace + (total - 11)
-        let other = total - 11;
-        return vec![11, other];
-    }
-
-    // Hard hands
-    if total <= 11 {
+    } else if is_soft {
+        Hand::from_cards(11, total - 11)
+    } else if total <= 11 {
         if total >= 4 {
-            vec![2, total - 2]
+            Hand::from_cards(2, total - 2)
         } else {
-            vec![total]
+            Hand::from_cards(total, 0) // edge case
         }
     } else if total <= 19 {
-        vec![10, total - 10]
-    } else if total == 20 {
-        vec![10, 10]
+        Hand::from_cards(10, total - 10)
     } else {
-        // Hard 21 needs 3 cards
-        vec![10, 10, 1]
+        Hand::from_cards(10, 10) // 20
     }
 }
